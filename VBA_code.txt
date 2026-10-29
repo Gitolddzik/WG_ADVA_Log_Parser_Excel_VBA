@@ -1,0 +1,1460 @@
+Option Explicit
+
+Private GlobalConditions As Object
+Private PromptShown As Boolean
+
+Sub ToggleDarkMode()
+    Dim isDark As Boolean
+    Dim wName As String
+    Dim wbPath As String
+    Dim msgAns As VbMsgBoxResult
+    Dim fsoObj As Object
+    
+    If ActiveWorkbook Is Nothing Then Exit Sub
+    
+    wName = LCase(ActiveWorkbook.Name)
+    wbPath = ActiveWorkbook.Path
+    If wbPath = "" Then wbPath = Application.DefaultFilePath
+    
+    If InStr(1, wName, "diagnostics_alarm", vbTextCompare) > 0 Or IsRawPMFileName(wName) Then
+        Set fsoObj = CreateObject("Scripting.FileSystemObject")
+        If fsoObj.FolderExists(wbPath & "\diagnostics") Then
+            msgAns = MsgBox("Wykryto glowny folder diagnostyczny." & vbCrLf & vbCrLf & _
+                            "Czy chcesz, aby skrypt samodzielnie:" & vbCrLf & _
+                            "1. Rozpakowal i zgrupowal logi PM (CSV) na osobne pliki KART i perfekcyjnie wyrownal ich kolumny?" & vbCrLf & _
+                            "2. Skopiowal logi tekstowe (cli_show-*.txt) do glownego folderu?", _
+                            vbYesNo + vbQuestion, "Automatyczny Pre-Processing PM & CLI")
+            If msgAns = vbYes Then
+                Call ParsePMDataToModules(wbPath)
+                Exit Sub
+            End If
+        End If
+    End If
+    
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+    
+    On Error GoTo ErrorHandler
+    
+    Call UnfuckCSV(ActiveSheet)
+    Call AutoDetectAndFormatLog(ActiveWorkbook, ActiveSheet)
+
+    isDark = False
+    If ActiveSheet.ListObjects.Count > 0 Then
+        If InStr(1, LCase(ActiveSheet.ListObjects(1).TableStyle), "dark") > 0 Then
+            isDark = True
+        End If
+    Else
+        If ActiveSheet.Cells(1, 1).Interior.Color = RGB(64, 64, 64) Then
+            isDark = True
+        End If
+    End If
+    
+    Call SmartInvertWholeSheet(Not isDark)
+
+Cleanup:
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Exit Sub
+ErrorHandler:
+    MsgBox "Blad: " & Err.Description, vbCritical
+    Resume Cleanup
+End Sub
+
+Function IsRawPMFileName(fName As String) As Boolean
+    Dim arr As Variant, itm As Variant
+    arr = Array("netif.csv", "proc.csv", "disk.csv", "memory.csv", "cpu.csv", "me.csv", "optl.csv", "optm.csv", "opt.csv", "sh.csv", "card.csv", "otuc2pa.csv", "mac.csv", "odu2e.csv", "oduf.csv", "otsi.csv", "secent.csv", "odu4.csv", "ety6.csv", "ety400.csv", "flexo4.csv", "ots.csv", "otsomssk.csv", "sysroute.csv", "ety4.csv", "ethif.csv", "otuc4.csv", "oduc4.csv")
+    For Each itm In arr
+        If LCase(fName) = itm Then
+            IsRawPMFileName = True
+            Exit Function
+        End If
+    Next itm
+    IsRawPMFileName = False
+End Function
+
+' NOWA FUNKCJA DO LOGOWANIA POSTĘPU (Pasek zadań Excela + Zapis do pliku TXT)
+Sub WritePMLog(ByVal logFilePath As String, ByVal msg As String)
+    On Error Resume Next
+    Dim fso As Object, ts As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    ' Otwórz plik do dopisywania (8), twórz jeśli nie istnieje (True)
+    Set ts = fso.OpenTextFile(logFilePath, 8, True)
+    ts.WriteLine Format(Now, "yyyy-mm-dd hh:nn:ss") & " - " & msg
+    ts.Close
+    
+    ' Aktualizuj pasek w lewym dolnym rogu Excela
+    Application.StatusBar = "Skrypt pracuje: " & msg
+    ' Wymuś odświeżenie interfejsu (zapobiega to "zawieszaniu" ekranu)
+    DoEvents
+    On Error GoTo 0
+End Sub
+
+Sub ParsePMDataToModules(rootPath As String)
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    
+    Dim logPath As String
+    logPath = rootPath & "\VBA_Parser_Log.txt"
+    Call WritePMLog(logPath, "=== START PARSOWANIA PM ===")
+    
+    Dim diagPath As String
+    diagPath = rootPath & "\diagnostics"
+    Call WritePMLog(logPath, "Wyszukiwanie folderu diagnostycznego: " & diagPath)
+    
+    Dim archPath As String
+    Dim csvPath As String
+    Dim tempFolder As String
+    Dim wsh As Object
+    Dim isTemp As Boolean
+    
+    csvPath = FindCSVFolder(fso.GetFolder(diagPath), False)
+    
+    If csvPath = "" Then
+        Call WritePMLog(logPath, "Folder CSV nie zostal odnaleziony od razu. Szukam archiwum history_*.tar.gz...")
+        archPath = FindPMArchive(fso.GetFolder(diagPath))
+        If archPath = "" Then
+            Call WritePMLog(logPath, "BLAD KRYTYCZNY: Nie znaleziono folderu 'csv' ani archiwum .tar.gz z PM.")
+            Application.StatusBar = False
+            MsgBox "Nie znaleziono folderu 'csv' ani archiwum .tar.gz z PM.", vbCritical, "Brak logow PM"
+            Exit Sub
+        End If
+        
+        Call WritePMLog(logPath, "Znaleziono archiwum: " & archPath)
+        Set wsh = CreateObject("WScript.Shell")
+        tempFolder = fso.GetSpecialFolder(2) & "\PMLogs_" & Format(Now, "YYYYMMDDHHMMSS")
+        fso.CreateFolder tempFolder
+        isTemp = True
+        
+        Call WritePMLog(logPath, "Rozpoczęto rozpakowywanie pierwszego stopnia (do folderu tymczasowego)... Może to potrwać kilkanaście sekund.")
+        wsh.Run "cmd.exe /c tar -xf """ & archPath & """ -C """ & tempFolder & """", 0, True
+        
+        Dim flArch As Object
+        For Each flArch In fso.GetFolder(tempFolder).Files
+            If LCase(fso.GetExtensionName(flArch.Name)) = "tar" Then
+                Call WritePMLog(logPath, "Zlokalizowano zagnieżdżony plik TAR: " & flArch.Name & ". Rozpoczęto wypakowywanie drugiego stopnia...")
+                wsh.Run "cmd.exe /c tar -xf """ & flArch.Path & """ -C """ & tempFolder & """", 0, True
+                Exit For
+            End If
+        Next flArch
+        
+        csvPath = FindCSVFolder(fso.GetFolder(tempFolder), True)
+        If csvPath = "" Then
+            Call WritePMLog(logPath, "BLAD KRYTYCZNY: Mimo wypakowania, archiwum nie zawiera poprawnie ułożonego folderu 'csv'.")
+            Application.StatusBar = False
+            MsgBox "Rozpakowano archiwum, ale nie znaleziono w nim folderu 'csv'.", vbCritical, "Blad struktury"
+            On Error Resume Next
+            fso.DeleteFolder tempFolder, True
+            Exit Sub
+        End If
+        Call WritePMLog(logPath, "Pomyślnie zlokalizowano rozpakowane pliki CSV.")
+    Else
+        isTemp = False
+        Call WritePMLog(logPath, "Wykryto, że folder z PM (CSV) jest już rozpakowany natywnie.")
+    End If
+    
+    Dim dictModules As Object
+    Set dictModules = CreateObject("Scripting.Dictionary")
+    
+    Call WritePMLog(logPath, "Trwa skanowanie bazy pików...")
+    Dim fldr As Object, fl As Object
+    Set fldr = fso.GetFolder(csvPath)
+    
+    Dim ts As Object
+    Dim lineStr As String, headerStr As String
+    Dim arr() As String, delim As String
+    Dim entCol As Long, dateCol As Long, i As Long, j As Long
+    Dim entName As String, modID As String, dateStr As String
+    Dim outLine As String
+    
+    Dim totalFiles As Long
+    Dim currentFile As Long
+    totalFiles = fldr.Files.Count
+    currentFile = 0
+    
+    For Each fl In fldr.Files
+        currentFile = currentFile + 1
+        If LCase(fso.GetExtensionName(fl.Name)) = "csv" Then
+            entName = Replace(fso.GetBaseName(fl.Name), ".csv", "")
+            Call WritePMLog(logPath, "Pobieranie i klasyfikacja logów z pliku (" & currentFile & "/" & totalFiles & "): " & fl.Name)
+            Set ts = fso.OpenTextFile(fl.Path, 1)
+            
+            If Not ts.AtEndOfStream Then
+                headerStr = ts.ReadLine()
+                delim = ","
+                If InStr(headerStr, ";") > 0 Then delim = ";"
+                
+                arr = SplitCSVLine(headerStr, delim)
+                entCol = -1
+                dateCol = -1
+                
+                outLine = ""
+                For j = 0 To UBound(arr)
+                    outLine = outLine & """" & arr(j) & """" & ";"
+                Next j
+                If Len(outLine) > 0 Then outLine = Left(outLine, Len(outLine) - 1)
+                headerStr = outLine
+                
+                For i = 0 To UBound(arr)
+                    Dim h As String
+                    h = LCase(arr(i))
+                    If h = "entity" Or h = "entid" Or h = "aid" Or h = "module" Then entCol = i
+                    If h = "start time" Or h = "date" Or h = "time" Or h = "timestamp" Then dateCol = i
+                Next i
+                
+                If entCol <> -1 Then
+                    Do While Not ts.AtEndOfStream
+                        lineStr = ts.ReadLine()
+                        If Trim(lineStr) <> "" Then
+                            arr = SplitCSVLine(lineStr, delim)
+                            If UBound(arr) >= entCol Then
+                                modID = ExtractModule(arr(entCol))
+                                dateStr = ""
+                                If dateCol <> -1 And UBound(arr) >= dateCol Then dateStr = Trim(arr(dateCol))
+                                
+                                outLine = ""
+                                For j = 0 To UBound(arr)
+                                    outLine = outLine & """" & arr(j) & """" & ";"
+                                Next j
+                                If Len(outLine) > 0 Then outLine = Left(outLine, Len(outLine) - 1)
+                                
+                                If Not dictModules.exists(modID) Then
+                                    dictModules.Add modID, CreateObject("Scripting.Dictionary")
+                                End If
+                                
+                                If Not dictModules(modID).exists(entName) Then
+                                    dictModules(modID).Add entName, CreateObject("Scripting.Dictionary")
+                                    dictModules(modID)(entName).Add "Header", headerStr
+                                    dictModules(modID)(entName).Add "Lines", New Collection
+                                    dictModules(modID)(entName).Add "Dates", New Collection
+                                End If
+                                
+                                dictModules(modID)(entName)("Lines").Add outLine
+                                dictModules(modID)(entName)("Dates").Add dateStr
+                            End If
+                        End If
+                    Loop
+                End If
+            End If
+            ts.Close
+        End If
+    Next fl
+    
+    Call WritePMLog(logPath, "Koniec czytania danych źródłowych. Rozpoczynam grupowanie kart do plików docelowych.")
+    
+    Dim baseName As String
+    baseName = fso.GetFolder(rootPath).Name
+    If InStr(baseName, "_Diagnostics") > 0 Then
+        baseName = Left(baseName, InStr(baseName, "_Diagnostics") - 1)
+    End If
+    
+    Dim mk As Variant, ek As Variant
+    Dim outTS As Object, outPath As String
+    Dim filesCreated As Long, txtFilesCopied As Long
+    Dim pad As String, colCount As Long
+    filesCreated = 0
+    
+    For Each mk In dictModules.Keys
+        outPath = rootPath & "\" & baseName & "__MOD-" & mk & ".csv"
+        Call WritePMLog(logPath, "Tworzenie ujednoliconego pliku dla Modułu: MOD-" & mk)
+        Set outTS = fso.CreateTextFile(outPath, True)
+        
+        For Each ek In dictModules(mk).Keys
+            headerStr = dictModules(mk)(ek)("Header")
+            
+            colCount = UBound(Split(headerStr, ";"))
+            If colCount > 0 Then pad = String(colCount, ";") Else pad = ""
+            
+            outTS.WriteLine "=== LAYER: " & UCase(ek) & " ===" & pad
+            outTS.WriteLine headerStr
+            
+            Dim colLines As Collection, colDates As Collection
+            Set colLines = dictModules(mk)(ek)("Lines")
+            Set colDates = dictModules(mk)(ek)("Dates")
+            
+            Dim cnt As Long
+            cnt = colLines.Count
+            If cnt > 0 Then
+                Dim arrL() As String, arrD() As String
+                ReDim arrL(1 To cnt)
+                ReDim arrD(1 To cnt)
+                
+                ' ========================================================
+                ' KLUCZOWY FIX WYDAJNOŚCI - Zapobiega złożoności O(N^2)
+                ' ========================================================
+                Dim itmVar As Variant
+                i = 1
+                For Each itmVar In colLines
+                    arrL(i) = itmVar
+                    i = i + 1
+                Next itmVar
+                
+                i = 1
+                For Each itmVar In colDates
+                    arrD(i) = itmVar
+                    i = i + 1
+                Next itmVar
+                ' ========================================================
+                
+                SortPMRows arrL, arrD, 1, cnt
+                
+                For i = 1 To cnt
+                    outTS.WriteLine arrL(i)
+                Next i
+            End If
+            
+            outTS.WriteLine pad
+        Next ek
+        outTS.Close
+        filesCreated = filesCreated + 1
+    Next mk
+    
+    Call WritePMLog(logPath, "Sortowanie i zapisywanie zakończone pomyślnie.")
+    Call WritePMLog(logPath, "Rozpoczęto wyciąganie plików txt (CLI)...")
+    txtFilesCopied = CopyCliTxtFiles(fso.GetFolder(diagPath), rootPath, baseName, fso)
+    
+    If isTemp Then
+        Call WritePMLog(logPath, "Usuwanie śmieci tymczasowych po rozpakowywaniu...")
+        On Error Resume Next
+        fso.DeleteFolder tempFolder, True
+        On Error GoTo 0
+    End If
+    
+    Call WritePMLog(logPath, "=== ZAKOŃCZONO SUKCESEM ===")
+    Application.StatusBar = False ' Ukryj pasek postepu
+    
+    MsgBox "Zakonczono!" & vbCrLf & vbCrLf & _
+           "- Rozbito i zgrupowano logi PM do: " & filesCreated & " kart(y) modulu." & vbCrLf & _
+           "- Skopiowano " & txtFilesCopied & " plikow konfiguracyjnych cli_show-*.txt" & vbCrLf & vbCrLf & _
+           "Dodano plik z logami postępu VBA_Parser_Log.txt, gotowe!", vbInformation, "Sukces"
+End Sub
+
+Function CopyCliTxtFiles(ByVal startFolder As Object, ByVal destPath As String, ByVal baseName As String, ByVal fso As Object) As Long
+    Dim fl As Object, subFldr As Object
+    Dim fName As String, parentPath As String, modStr As String
+    Dim copiedCount As Long
+    copiedCount = 0
+    
+    For Each fl In startFolder.Files
+        fName = LCase(fl.Name)
+        If fName Like "cli_show-*.txt" Then
+            parentPath = LCase(fl.Path)
+            modStr = ExtractModule(parentPath)
+            
+            If modStr = "1-X" Then modStr = "SYS"
+            
+            On Error Resume Next
+            fso.CopyFile fl.Path, destPath & "\" & baseName & "__MOD-" & modStr & "__" & fl.Name, True
+            If Err.Number = 0 Then copiedCount = copiedCount + 1
+            On Error GoTo 0
+        End If
+    Next fl
+    
+    For Each subFldr In startFolder.SubFolders
+        copiedCount = copiedCount + CopyCliTxtFiles(subFldr, destPath, baseName, fso)
+    Next subFldr
+    
+    CopyCliTxtFiles = copiedCount
+End Function
+
+Sub SortPMRows(ByRef arr() As String, ByRef dates() As String, ByVal first As Long, ByVal last As Long)
+    Dim pivot As String, tempStr As String
+    Dim i As Long, j As Long
+    
+    If first >= last Then Exit Sub
+    
+    pivot = dates((first + last) \ 2)
+    i = first
+    j = last
+    
+    Do While i <= j
+        Do While dates(i) > pivot
+            i = i + 1
+        Loop
+        Do While dates(j) < pivot
+            j = j - 1
+        Loop
+        
+        If i <= j Then
+            tempStr = dates(i)
+            dates(i) = dates(j)
+            dates(j) = tempStr
+            
+            tempStr = arr(i)
+            arr(i) = arr(j)
+            arr(j) = tempStr
+            
+            i = i + 1
+            j = j - 1
+        End If
+    Loop
+    
+    If first < j Then SortPMRows arr, dates, first, j
+    If i < last Then SortPMRows arr, dates, i, last
+End Sub
+
+Function FindPMArchive(ByVal startFolder As Object) As String
+    Dim subFldr As Object, fl As Object
+    For Each fl In startFolder.Files
+        If LCase(fl.Name) Like "history_*.tar.gz" Or LCase(fl.Name) Like "history_*.tar" Then
+            FindPMArchive = fl.Path
+            Exit Function
+        End If
+    Next fl
+    For Each subFldr In startFolder.SubFolders
+        Dim res As String
+        res = FindPMArchive(subFldr)
+        If res <> "" Then
+            FindPMArchive = res
+            Exit Function
+        End If
+    Next subFldr
+    FindPMArchive = ""
+End Function
+
+Function FindCSVFolder(ByVal startFolder As Object, ByVal isTemp As Boolean) As String
+    Dim subFldr As Object
+    If LCase(startFolder.Name) = "csv" Then
+        If isTemp Then
+            FindCSVFolder = startFolder.Path
+            Exit Function
+        ElseIf InStr(1, LCase(startFolder.Path), "history", vbTextCompare) > 0 Or InStr(1, LCase(startFolder.Path), "aoscore", vbTextCompare) > 0 Then
+            FindCSVFolder = startFolder.Path
+            Exit Function
+        End If
+    End If
+    For Each subFldr In startFolder.SubFolders
+        Dim res As String
+        res = FindCSVFolder(subFldr, isTemp)
+        If res <> "" Then
+            FindCSVFolder = res
+            Exit Function
+        End If
+    Next subFldr
+    FindCSVFolder = ""
+End Function
+
+Function ExtractModule(ByVal text As String) As String
+    Dim regEx As Object
+    Set regEx = CreateObject("VBScript.RegExp")
+    regEx.IgnoreCase = True
+    regEx.Global = False
+    
+    Dim shelfStr As String: shelfStr = "1"
+    Dim slotStr As String: slotStr = "X"
+    
+    regEx.Pattern = "card-([0-9]+)-([a-zA-Z0-9\-]+)"
+    If regEx.Test(text) Then
+        shelfStr = regEx.Execute(text)(0).SubMatches(0)
+        slotStr = regEx.Execute(text)(0).SubMatches(1)
+        ExtractModule = shelfStr & "-" & slotStr
+        Exit Function
+    End If
+    
+    regEx.Pattern = "shelf[,=\.\-]([0-9]+)"
+    If regEx.Test(text) Then shelfStr = regEx.Execute(text)(0).SubMatches(0)
+    
+    regEx.Pattern = "slot[,=\.\-]([a-zA-Z0-9\-]+)"
+    If regEx.Test(text) Then
+        slotStr = regEx.Execute(text)(0).SubMatches(0)
+    Else
+        regEx.Pattern = "(?:card|eqp|board|eq)[,=\.\-]([a-zA-Z0-9\-]+)"
+        If regEx.Test(text) Then slotStr = regEx.Execute(text)(0).SubMatches(0)
+    End If
+    
+    ExtractModule = shelfStr & "-" & slotStr
+End Function
+
+Function SplitCSVLine(ByVal line As String, ByVal delim As String) As String()
+    Dim res() As String
+    Dim i As Long, tCount As Long
+    Dim inQ As Boolean
+    Dim char As String, t As String
+    
+    ReDim res(0 To 50)
+    inQ = False
+    tCount = 0
+    
+    For i = 1 To Len(line)
+        char = Mid(line, i, 1)
+        If char = """" Then
+            inQ = Not inQ
+        ElseIf char = delim And Not inQ Then
+            If tCount > UBound(res) Then ReDim Preserve res(0 To UBound(res) + 50)
+            res(tCount) = Replace(t, """", "")
+            tCount = tCount + 1
+            t = ""
+        Else
+            t = t & char
+        End If
+    Next i
+    
+    If tCount > UBound(res) Then ReDim Preserve res(0 To UBound(res) + 1)
+    res(tCount) = Replace(t, """", "")
+    ReDim Preserve res(0 To tCount)
+    SplitCSVLine = res
+End Function
+
+Sub UnfuckCSV(ws As Worksheet)
+    Dim lastCol As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    If lastCol = 1 Then
+        Application.DisplayAlerts = False
+        On Error Resume Next
+        ws.Columns("A:A").TextToColumns Destination:=ws.Range("A1"), DataType:=xlDelimited, Semicolon:=True, Comma:=True
+        On Error GoTo 0
+        Application.DisplayAlerts = True
+    End If
+End Sub
+
+Sub AutoDetectAndFormatLog(wb As Workbook, ws As Worksheet)
+    Dim r As Long, c As Long
+    Dim isMerged As Boolean
+    
+    isMerged = False
+    For r = 1 To 4
+        For c = 1 To 20
+            If LCase(Trim(ws.Cells(r, c).Text)) = "num" Then
+                isMerged = True
+                Exit For
+            End If
+        Next c
+        If isMerged Then Exit For
+    Next r
+    
+    If isMerged Or LCase(wb.Name) Like "*merged*" Then
+        Call Format_MERGED_LOG(ws)
+    Else
+        Call Format_GENERIC(ws)
+    End If
+End Sub
+
+Sub Format_MERGED_LOG(ws As Worksheet)
+    Dim lastRow As Long, lastCol As Long
+    Dim r As Long, c As Long, bIdx As Long, hRow As Long
+    Dim nB As Long
+    Dim bS() As Long, bE() As Long
+    Dim colCond As Long, delCol As Long
+    Dim inNode As Boolean
+    Dim txtH As String
+    
+    hRow = 0
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+    For r = 1 To 4
+        If InStr(1, LCase(Trim(ws.Cells(r, 1).Text) & Trim(ws.Cells(r, 2).Text)), "src") > 0 Then
+            hRow = r
+            Exit For
+        End If
+    Next r
+    
+    If hRow = 0 Then Exit Sub
+    If hRow = 1 Then
+        ws.Rows(1).Insert Shift:=xlDown
+        hRow = 2
+        lastRow = lastRow + 1
+    End If
+    
+    lastCol = ws.Cells(hRow, ws.Columns.Count).End(xlToLeft).Column
+    
+    For delCol = lastCol To 1 Step -1
+        If LCase(Trim(ws.Cells(hRow, delCol).Text)) = "sev(fl)" Or LCase(Trim(ws.Cells(hRow, delCol).Text)) = "act(fl)" Then
+            ws.Columns(delCol).Delete Shift:=xlToLeft
+        End If
+    Next delCol
+    
+    lastCol = ws.Cells(hRow, ws.Columns.Count).End(xlToLeft).Column
+    nB = 0
+    inNode = False
+    
+    For c = 1 To lastCol
+        txtH = LCase(Trim(ws.Cells(hRow, c).Text))
+        If (txtH Like "num*" Or txtH Like "sev(fl)_*") And Not inNode Then
+            nB = nB + 1
+            ReDim Preserve bS(1 To nB)
+            ReDim Preserve bE(1 To nB)
+            bS(nB) = c
+            If nB > 1 Then bE(nB - 1) = c - 1
+            inNode = True
+        End If
+        If txtH Like "key*" Then inNode = False
+    Next c
+    If nB > 0 Then bE(nB) = lastCol
+    
+    For bIdx = nB To 1 Step -1
+        colCond = 0
+        For c = bS(bIdx) To bE(bIdx)
+            If LCase(Trim(ws.Cells(hRow, c).Text)) Like "cond*" Then
+                colCond = c
+                Exit For
+            End If
+        Next c
+        
+        If colCond > 1 Then
+            If Not (LCase(Trim(ws.Cells(hRow, colCond - 1).Text)) Like "dir*") Then
+                If bIdx = 1 Then
+                    ws.Columns(colCond + 1).Insert Shift:=xlToRight
+                    ws.Cells(hRow, colCond + 1).Value = "DIR_N_" & bIdx
+                    ws.Columns(colCond).Insert Shift:=xlToRight
+                    ws.Cells(hRow, colCond).Value = "DIR_C_" & bIdx
+                Else
+                    ws.Columns(colCond + 1).Insert Shift:=xlToRight
+                    ws.Cells(hRow, colCond + 1).Value = "DIR_C_" & bIdx
+                    ws.Columns(colCond).Insert Shift:=xlToRight
+                    ws.Cells(hRow, colCond).Value = "DIR_N_" & bIdx
+                End If
+            End If
+            
+            If Not (LCase(Trim(ws.Cells(hRow, bS(bIdx)).Text)) Like "sev(fl)_*") Then
+                ws.Columns(bS(bIdx)).Insert Shift:=xlToRight
+                ws.Cells(hRow, bS(bIdx)).Value = "Act(FL)_" & bIdx
+                ws.Columns(bS(bIdx)).Insert Shift:=xlToRight
+                ws.Cells(hRow, bS(bIdx)).Value = "Sev(FL)_" & bIdx
+            End If
+        End If
+    Next bIdx
+    
+    lastCol = ws.Cells(hRow, ws.Columns.Count).End(xlToLeft).Column
+    If ws.ListObjects.Count = 0 Then
+        ws.ListObjects.Add(xlSrcRange, ws.Range(ws.Cells(hRow, 1), ws.Cells(lastRow, lastCol)), , xlYes).TableStyle = "TableStyleLight9"
+    End If
+    Call AverageColumnWidths(ws)
+End Sub
+
+Sub Format_GENERIC(ws As Worksheet)
+    Dim r As Long, c As Long
+    Dim lastRow As Long, lastCol As Long
+    Dim vData As Variant
+    Dim dirCol As Long, dirMatch As Long
+    Dim txt As String, dirVal As String
+    
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    
+    If ws.Cells(1, 1).Value <> "DIR_GEN" Then
+        ws.Columns(1).Insert Shift:=xlToRight
+        ws.Cells(1, 1).Value = "DIR_GEN"
+        lastCol = lastCol + 1
+        
+        vData = ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, lastCol)).Value
+        dirCol = 0
+        
+        For c = 2 To lastCol
+            If LCase(Trim(vData(1, c))) = "direction" Or LCase(Trim(vData(1, c))) = "dirn" Then
+                dirCol = c
+                Exit For
+            End If
+        Next c
+        
+        For r = 2 To lastRow
+            dirVal = "-"
+            If dirCol > 0 Then
+                dirVal = LCase(Trim(vData(r, dirCol)))
+            Else
+                txt = ""
+                For c = 2 To lastCol
+                    txt = txt & LCase(CStr(vData(r, c))) & "|"
+                Next c
+                
+                dirMatch = InStr(txt, """dirn"":""")
+                If dirMatch > 0 Then
+                    dirVal = Mid(txt, dirMatch + 8, 2)
+                ElseIf InStr(txt, "|rx|") > 0 Then
+                    dirVal = "rx"
+                ElseIf InStr(txt, "|tx|") > 0 Then
+                    dirVal = "tx"
+                End If
+            End If
+            
+            If InStr(dirVal, "rx") > 0 Or InStr(dirVal, "rcv") > 0 Then
+                dirVal = "<- RCV"
+            ElseIf InStr(dirVal, "tx") > 0 Or InStr(dirVal, "trmt") > 0 Then
+                dirVal = "-> TX"
+            Else
+                dirVal = "-"
+            End If
+            ws.Cells(r, 1).Value = dirVal
+        Next r
+    End If
+    
+    If ws.ListObjects.Count = 0 Then
+        ws.ListObjects.Add(xlSrcRange, ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, lastCol)), , xlYes).TableStyle = "TableStyleLight9"
+    End If
+    Call AverageColumnWidths(ws)
+End Sub
+
+Sub AverageColumnWidths(ws As Worksheet)
+    Dim c As Long, r As Long, maxR As Long
+    Dim totalLen As Long, avgLen As Long, validRows As Long
+    Dim vData As Variant
+    Dim lastRow As Long, lastCol As Long
+    
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    maxR = lastRow
+    If maxR > 50 Then maxR = 50
+    
+    vData = ws.Range(ws.Cells(1, 1), ws.Cells(maxR, lastCol)).Value
+    
+    For c = 1 To lastCol
+        totalLen = 0
+        validRows = 0
+        For r = 1 To maxR
+            If Not IsEmpty(vData(r, c)) Then
+                totalLen = totalLen + Len(CStr(vData(r, c)))
+                validRows = validRows + 1
+            End If
+        Next r
+        
+        If validRows > 0 Then
+            avgLen = (totalLen \ validRows) + 4
+            If avgLen < 12 Then avgLen = 12
+            If avgLen > 45 Then avgLen = 45
+            ws.Columns(c).ColumnWidth = avgLen
+        Else
+            ws.Columns(c).ColumnWidth = 12
+        End If
+    Next c
+End Sub
+
+Function GetPriorityColor(txt As String, sev As String, act As String, cmd As String, aid As String, ByRef outS As Long) As Long
+    Dim u As String
+    Dim isNet As Boolean
+    Dim is15M As Boolean
+    Dim isAdminAction As Boolean
+    Dim isPM As Boolean
+    
+    u = UCase(txt)
+    sev = UCase(sev)
+    act = UCase(act)
+    cmd = UCase(cmd)
+    isNet = (InStr(UCase(aid), "-N") > 0)
+    is15M = (InStr(u, "15M") > 0)
+    
+    isPM = (InStr(u, "-HT") > 0 Or InStr(u, "-LT") > 0 Or InStr(u, "T-") = 1 Or InStr(u, "'T-") > 0 Or InStr(u, "T_") > 0 Or InStr(u, "CRC") > 0)
+    
+    If InStr(u, "FALSE") > 0 Then
+        GetPriorityColor = RGB(191, 97, 106)
+        outS = 100
+        Exit Function
+    End If
+    
+    If InStr(u, "SNMP") > 0 Or InStr(u, "TRAPSINK") > 0 Or InStr(u, "CPY-") > 0 Or InStr(u, "NTP") > 0 Or cmd = "FORCEDDELETE" Then
+        GetPriorityColor = RGB(80, 80, 80)
+        outS = 0
+        Exit Function
+    End If
+    
+    If InStr(u, "LCT") > 0 Or InStr(u, "UAS") > 0 Or InStr(u, "PM") > 0 Or InStr(u, "EQLZ") > 0 Or InStr(u, "OOSAINS") > 0 Or InStr(u, "DBACT") > 0 Then
+        If InStr(u, "FWPM") = 0 And InStr(u, "T-") = 0 And InStr(u, "EQLZ FAIL") = 0 And InStr(u, "EQLZ-FAIL") = 0 And InStr(u, "EQLZ DANY") = 0 And InStr(u, "EQLZ-DENY") = 0 Then
+            GetPriorityColor = RGB(80, 80, 80)
+            outS = 10
+            Exit Function
+        End If
+    End If
+    
+    If act = "CLEAR" Or act = "CL" Or InStr(u, "CLEAR") > 0 Or InStr(u, "COMPL") > 0 Or InStr(u, "NTFNCODE:CL") > 0 Then
+        GetPriorityColor = RGB(163, 190, 140)
+        outS = 30
+        Exit Function
+    End If
+    
+    If InStr(u, "FWPM-SA") > 0 Or (InStr(u, "SYSTEM") > 0 And (InStr(u, "UNPLUG") > 0 Or InStr(u, "FAN") > 0 Or InStr(u, "PSU") > 0)) Or InStr(u, "SMOKE ALARM") > 0 Or (InStr(u, "LOS=") > 0 And act <> "CLEAR") Or (InStr(u, "LOS-") > 0 And act <> "CLEAR") Or InStr(u, "RMVD") > 0 Or InStr(u, "HWFLT") > 0 Or InStr(u, "MIDFLT") > 0 Or InStr(u, "FANFLT") > 0 Or InStr(u, "PSUFLT") > 0 Or InStr(u, "VOLTOUT-FAIL") > 0 Or InStr(u, "COMP-TEMP-SD") > 0 Or InStr(u, "ASELOW") > 0 Then
+        GetPriorityColor = RGB(191, 97, 106)
+        outS = 100
+        Exit Function
+    End If
+    
+    If sev = "CR" Or InStr(u, "CR-SET") > 0 Or InStr(u, ",CR,SET") > 0 Or InStr(u, "NTFNCODE:CR") > 0 Then
+        GetPriorityColor = RGB(191, 97, 106)
+        outS = 95
+        Exit Function
+    End If
+
+    If isPM Then
+        If InStr(u, "OTU") > 0 Then
+            GetPriorityColor = RGB(211, 113, 105)
+            outS = 91
+        ElseIf InStr(u, "ODU") > 0 Then
+            GetPriorityColor = RGB(208, 135, 112)
+            outS = 86
+        ElseIf InStr(u, "OPU") > 0 Or InStr(u, "LOOMFI") > 0 Or InStr(u, "PCS") > 0 Or InStr(u, "FC-") > 0 Or InStr(u, "MAC") > 0 Then
+            GetPriorityColor = RGB(216, 160, 113)
+            outS = 81
+        ElseIf InStr(u, "FEC") > 0 Or InStr(u, "CRC") > 0 Then
+            GetPriorityColor = RGB(211, 113, 105)
+            outS = 88
+        Else
+            GetPriorityColor = RGB(216, 160, 113)
+            outS = 80
+        End If
+        If InStr(u, "UAS") > 0 Then outS = outS + 2
+        If is15M Then outS = outS + 1
+        If isNet Then outS = outS + 1
+        Exit Function
+    End If
+
+    If InStr(u, "LOCAL_FAULT") > 0 Or InStr(u, "LOCAL_FAULT-TX") > 0 Or InStr(u, "T-OPT-LT") > 0 Or InStr(u, "MEA-PHYS") > 0 Or InStr(u, "MEA-CHANNEL") > 0 Or InStr(u, "MSIM") > 0 Then
+        If sev = "MN" Or InStr(u, "MN-SET") > 0 Then
+            GetPriorityColor = RGB(235, 203, 139)
+            outS = 70
+        Else
+            GetPriorityColor = RGB(208, 135, 112)
+            outS = 85
+        End If
+        Exit Function
+    End If
+    
+    If InStr(u, "FNRPNT-MIS") > 0 Or InStr(u, "CRYDATAINV") > 0 Or InStr(u, "CRYSVC-MIS") > 0 Then
+        GetPriorityColor = RGB(191, 97, 106)
+        outS = 95
+        Exit Function
+    End If
+    
+    If InStr(u, "CRYPW-MIS") > 0 Or InStr(u, "KEXINIT-MIS") > 0 Then
+        GetPriorityColor = RGB(235, 203, 139)
+        outS = 70
+        Exit Function
+    End If
+    
+    If InStr(u, "KEX-FAIL") > 0 Or InStr(u, "CRYTST__CONDITION") > 0 Or InStr(u, "FNRPNT-COMPLETE") > 0 Or InStr(u, "FNRPNT-ACCEPT") > 0 Or InStr(u, "CRYKEY-GEN") > 0 Then
+        GetPriorityColor = RGB(165, 113, 184)
+        outS = 55
+        Exit Function
+    End If
+    
+    If sev = "MJ" Or InStr(u, "FWPM-NSA") > 0 Or InStr(u, "MJ-SET") > 0 Or InStr(u, ",MJ,SET") > 0 Or InStr(u, "NTFNCODE:MJ") > 0 Then
+        GetPriorityColor = RGB(208, 135, 112)
+        outS = 85
+        Exit Function
+    End If
+    
+    If InStr(u, "EQLZ FAIL") > 0 Or InStr(u, "EQLZ-FAIL") > 0 Or InStr(u, "EQLZ DANY") > 0 Or InStr(u, "EQLZ-DENY") > 0 Then
+        GetPriorityColor = RGB(215, 100, 100)
+        outS = 82
+        Exit Function
+    End If
+    
+    If sev = "MN" Or InStr(u, "MN-SET") > 0 Or InStr(u, ",MN,SET") > 0 Or InStr(u, "NTFNCODE:MN") > 0 Then
+        GetPriorityColor = RGB(235, 203, 139)
+        outS = 70
+        Exit Function
+    End If
+    
+    If sev = "WN" Or sev = "WR" Or InStr(u, "WN-SET") > 0 Or InStr(u, ",WR,SET") > 0 Then
+        GetPriorityColor = RGB(216, 181, 113)
+        outS = 60
+        Exit Function
+    End If
+    
+    If InStr(u, "WKSBK") > 0 Or InStr(u, "WKSWBK") > 0 Or InStr(u, "APS-CONF") > 0 Or InStr(u, "PEER-LINK") > 0 Or InStr(u, "FENDCHG") > 0 Then
+        GetPriorityColor = RGB(165, 113, 184)
+        outS = 55
+        Exit Function
+    End If
+    
+    isAdminAction = False
+    If InStr(u, "ADMIN=") > 0 Then isAdminAction = True
+    If InStr(u, "OOSMT") > 0 Then isAdminAction = True
+    If InStr(u, "OOSMGT") > 0 Then isAdminAction = True
+    If InStr(u, "OOSDSBLD") > 0 Then isAdminAction = True
+    If InStr(u, "FRCD-") > 0 Then isAdminAction = True
+    If InStr(u, "BOOT") > 0 Then isAdminAction = True
+    If InStr(u, "SWACT") > 0 Then isAdminAction = True
+    If cmd = "EDIT" Then isAdminAction = True
+    
+    If isAdminAction Then
+        GetPriorityColor = RGB(129, 161, 193)
+        outS = 40
+        Exit Function
+    End If
+    
+    If sev = "NA" Or sev = "NR" Or InStr(u, "NA-NA") > 0 Or InStr(u, "NR-NA") > 0 Then
+        GetPriorityColor = RGB(115, 115, 115)
+        outS = 20
+        Exit Function
+    End If
+    
+    If Len(Replace(Replace(Replace(u, "|", ""), ",", ""), "-", "")) > 2 Then
+        GetPriorityColor = RGB(80, 80, 80)
+        outS = 5
+        Exit Function
+    End If
+    
+    outS = 0
+    GetPriorityColor = -1
+End Function
+
+Function ExtractSev(c As String) As String
+    c = UCase(c)
+    If c = "" Then
+        ExtractSev = ""
+        Exit Function
+    End If
+    If InStr(c, "=CR-") > 0 Or InStr(c, ",CR,") > 0 Or InStr(c, "CR-SET") > 0 Or InStr(c, "NTFNCODE:CR") > 0 Or InStr(c, "LOCAL_FAULT-TX") > 0 Then
+        ExtractSev = "CR"
+    ElseIf InStr(c, "=MJ-") > 0 Or InStr(c, ",MJ,") > 0 Or InStr(c, "MJ-SET") > 0 Or InStr(c, "NTFNCODE:MJ") > 0 Or ((InStr(c, "ES") > 0 Or InStr(c, "SES") > 0) And InStr(c, "FEC") > 0) Then
+        ExtractSev = "MJ"
+    ElseIf InStr(c, "=MN-") > 0 Or InStr(c, ",MN,") > 0 Or InStr(c, "MN-SET") > 0 Or InStr(c, "NTFNCODE:MN") > 0 Or (InStr(c, "CE") > 0 And InStr(c, "FEC") > 0) Then
+        ExtractSev = "MN"
+    ElseIf InStr(c, "=WN-") > 0 Or InStr(c, "=WR-") > 0 Or InStr(c, "WN-SET") > 0 Then
+        ExtractSev = "WN"
+    ElseIf InStr(c, "=NA-") > 0 Or InStr(c, "=NR-") > 0 Or InStr(c, "NA-NA") > 0 Or InStr(c, "NR-NA") > 0 Then
+        ExtractSev = "NA"
+    Else
+        ExtractSev = ""
+    End If
+End Function
+
+Function ExtractAct(c As String) As String
+    c = UCase(c)
+    If c = "" Then
+        ExtractAct = ""
+        Exit Function
+    End If
+    If InStr(c, "-SET") > 0 Or InStr(c, ",SET,") > 0 Then
+        ExtractAct = "SET"
+    ElseIf InStr(c, "-CLEAR") > 0 Or InStr(c, ",CLEAR,") > 0 Or InStr(c, "NTFNCODE:CL") > 0 Then
+        ExtractAct = "CLEAR"
+    ElseIf InStr(c, "NA-NA") > 0 Or InStr(c, "NR-NA") > 0 Then
+        ExtractAct = "NA"
+    Else
+        ExtractAct = ""
+    End If
+End Function
+
+Function GetAlarmLogColor(txt As String) As Long
+    Dim u As String
+    u = UCase(txt)
+    If InStr(u, "FALSE") > 0 Then
+        GetAlarmLogColor = RGB(191, 97, 106)
+    ElseIf InStr(u, """CR""") > 0 Or InStr(u, "|CR|") > 0 Or InStr(u, "CRITICAL") > 0 Or InStr(u, "CR-SET") > 0 Or (InStr(u, "LOS=") > 0 And InStr(u, "CLEAR") = 0) Or (InStr(u, "LOS-") > 0 And InStr(u, "CLEAR") = 0) Then
+        GetAlarmLogColor = RGB(191, 97, 106)
+    ElseIf InStr(u, """MJ""") > 0 Or InStr(u, "|MJ|") > 0 Or InStr(u, "MAJOR") > 0 Or InStr(u, "MJ-SET") > 0 Then
+        GetAlarmLogColor = RGB(208, 135, 112)
+    ElseIf InStr(u, """MN""") > 0 Or InStr(u, "|MN|") > 0 Or InStr(u, "MINOR") > 0 Or InStr(u, "MN-SET") > 0 Then
+        GetAlarmLogColor = RGB(235, 203, 139)
+    ElseIf InStr(u, """CL""") > 0 Or InStr(u, "|CL|") > 0 Or InStr(u, "CLEAR") > 0 Then
+        GetAlarmLogColor = RGB(163, 190, 140)
+    ElseIf InStr(u, """WN""") > 0 Or InStr(u, "|WN|") > 0 Or InStr(u, "WARNING") > 0 Or InStr(u, "WN-SET") > 0 Then
+        GetAlarmLogColor = RGB(216, 181, 113)
+    ElseIf InStr(u, "-HT") > 0 Or InStr(u, "-LT") > 0 Or InStr(u, "T-") > 0 Or InStr(u, "CRC") > 0 Then
+        GetAlarmLogColor = RGB(216, 160, 113)
+    Else
+        GetAlarmLogColor = -1
+    End If
+End Function
+
+Function BuildHiddenDBFromDictFile(filePath As String) As Boolean
+    Dim fso As Object, ts As Object
+    Dim content As String
+    Dim lines() As String
+    Dim i As Long, rRow As Long
+    Dim lineText As String, kw As String, valStr As String
+    Dim q1 As Long, q2 As Long, q3 As Long, q4 As Long
+    Dim wsDB As Worksheet
+    Dim dataArr() As Variant
+    
+    On Error Resume Next
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set ts = fso.OpenTextFile(filePath, 1, False, -2)
+    If ts Is Nothing Then GoTo Fail
+    content = ts.ReadAll
+    ts.Close
+    On Error GoTo 0
+    
+    content = Replace(content, vbCrLf, vbLf)
+    content = Replace(content, vbCr, vbLf)
+    lines = Split(content, vbLf)
+    If UBound(lines) < 0 Then GoTo Fail
+    
+    Set wsDB = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+    wsDB.Name = "ConditionsDB"
+    wsDB.Cells(1, 1).Value = "KEYWORD"
+    wsDB.Cells(1, 2).Value = "VAL"
+    
+    rRow = 2
+    ReDim dataArr(1 To UBound(lines) + 2, 1 To 2)
+    
+    For i = 0 To UBound(lines)
+        lineText = Trim(lines(i))
+        If InStr(lineText, "dict.Add") > 0 Then
+            q1 = InStr(1, lineText, """")
+            If q1 > 0 Then
+                q2 = InStr(q1 + 1, lineText, """")
+                If q2 > 0 Then
+                    q3 = InStr(q2 + 1, lineText, """")
+                    If q3 > 0 Then
+                        q4 = InStrRev(lineText, """")
+                        If q4 > q3 Then
+                            kw = Mid(lineText, q1 + 1, q2 - q1 - 1)
+                            valStr = Mid(lineText, q3 + 1, q4 - q3 - 1)
+                            If kw <> "" Then
+                                dataArr(rRow - 1, 1) = kw
+                                dataArr(rRow - 1, 2) = valStr
+                                rRow = rRow + 1
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    Next i
+    
+    If rRow > 2 Then
+        wsDB.Range(wsDB.Cells(2, 1), wsDB.Cells(rRow, 2)).Value = dataArr
+        wsDB.Visible = xlSheetHidden
+        BuildHiddenDBFromDictFile = True
+    Else
+        Application.DisplayAlerts = False
+        wsDB.Delete
+        Application.DisplayAlerts = True
+        BuildHiddenDBFromDictFile = False
+    End If
+    Exit Function
+Fail:
+    BuildHiddenDBFromDictFile = False
+End Function
+
+Function GetConditionsDict() As Object
+    Dim wsDB As Worksheet
+    Dim answer As VbMsgBoxResult
+    Dim filePath As Variant
+    Dim r As Long, lRow As Long
+    Dim dataArr As Variant
+    Dim kw As String
+    Dim fso As Object
+    
+    If Not GlobalConditions Is Nothing Then
+        Set GetConditionsDict = GlobalConditions
+        Exit Function
+    End If
+    
+    Set GlobalConditions = CreateObject("Scripting.Dictionary")
+    GlobalConditions.CompareMode = 1
+    
+    On Error Resume Next
+    Set wsDB = ThisWorkbook.Sheets("ConditionsDB")
+    On Error GoTo 0
+    
+    If wsDB Is Nothing And Not PromptShown Then
+        PromptShown = True
+        
+        Set fso = CreateObject("Scripting.FileSystemObject")
+        filePath = ActiveWorkbook.Path & "\vba_dict.csv"
+        
+        If fso.FileExists(filePath) Then
+            Application.ScreenUpdating = False
+            If BuildHiddenDBFromDictFile(CStr(filePath)) Then
+                Set wsDB = ThisWorkbook.Sheets("ConditionsDB")
+            End If
+            Application.ScreenUpdating = True
+        Else
+            answer = MsgBox("Hover z opisami gotowy!" & vbCrLf & vbCrLf & _
+                            "Wskaz z dysku plik vba_dict.csv (lub umiesc go w tym folderze na przyszlosc).", vbYesNo + vbInformation, "Inicjalizacja")
+            If answer = vbYes Then
+                filePath = Application.GetOpenFilename("Pliki CSV/TXT (*.csv; *.txt), *.csv;*.txt", , "Wybierz vba_dict.csv")
+                If filePath <> False Then
+                    Application.ScreenUpdating = False
+                    If BuildHiddenDBFromDictFile(CStr(filePath)) = False Then
+                        MsgBox "Brak odpowiednich komend VBA. Zignorowano.", vbCritical, "Błąd"
+                    Else
+                        Set wsDB = ThisWorkbook.Sheets("ConditionsDB")
+                    End If
+                    Application.ScreenUpdating = True
+                End If
+            End If
+        End If
+    End If
+    
+    If Not GlobalConditions.exists("CRYTST__CONDITION") Then GlobalConditions.Add "CRYTST__CONDITION", "Crypto Self-Test | Encryption selftest running"
+    If Not GlobalConditions.exists("FNRPNT-MIS") Then GlobalConditions.Add "FNRPNT-MIS", "No Authentication Key | Authentication key is missing"
+    If Not GlobalConditions.exists("FNRPNT-COMPLETE__CONDITION") Then GlobalConditions.Add "FNRPNT-COMPLETE__CONDITION", "Auth Key Completed | Authentication key completed"
+    If Not GlobalConditions.exists("KEX-FAIL") Then GlobalConditions.Add "KEX-FAIL", "Key Exchange-Fail | At least one Key exchange failed"
+    If Not GlobalConditions.exists("CRYPW-MIS") Then GlobalConditions.Add "CRYPW-MIS", "Crypto Requires Password | Crypto Officer password missing"
+    If Not GlobalConditions.exists("KEXINIT-MIS") Then GlobalConditions.Add "KEXINIT-MIS", "Initial Key Exchange | The initial successful key exchange has not be completed"
+    If Not GlobalConditions.exists("CRYSVC-MIS") Then GlobalConditions.Add "CRYSVC-MIS", "Crypto Service Missing | Crypto Service is missing (HD cards only)"
+    If Not GlobalConditions.exists("FNRPNT-ACCEPT__CONDITION") Then GlobalConditions.Add "FNRPNT-ACCEPT__CONDITION", "Auth Key Rx Accepted | Authentication key received from the far end"
+    If Not GlobalConditions.exists("FWPEN__CONDITION") Then GlobalConditions.Add "FWPEN__CONDITION", "FWP-Allow Update | FWP upgrade is allowed"
+    If Not GlobalConditions.exists("SELFTEST-PASS") Then GlobalConditions.Add "SELFTEST-PASS", "Self Test-Pass | Self test passed"
+    If Not GlobalConditions.exists("FWPREVCHG") Then GlobalConditions.Add "FWPREVCHG", "FWP-Version Change | FWP upgrade revision number is changed"
+    If Not GlobalConditions.exists("FWPHASH-PASS") Then GlobalConditions.Add "FWPHASH-PASS", "FWP Hash Check-Pass | Firmware package hash verification passed"
+    If Not GlobalConditions.exists("CRYDATAINV") Then GlobalConditions.Add "CRYDATAINV", "Encryption Data Invalid | Received encryption data is invalid"
+    If Not GlobalConditions.exists("CRYKEY-GEN__CONDITION") Then GlobalConditions.Add "CRYKEY-GEN__CONDITION", "Start Pairing | Authentication Key created and ready to use"
+    
+    If Not wsDB Is Nothing Then
+        lRow = wsDB.Cells(wsDB.Rows.Count, 1).End(xlUp).Row
+        If lRow > 1 Then
+            dataArr = wsDB.Range(wsDB.Cells(2, 1), wsDB.Cells(lRow, 2)).Value
+            For r = 1 To UBound(dataArr, 1)
+                If Not IsEmpty(dataArr(r, 1)) Then
+                    kw = Trim(CStr(dataArr(r, 1)))
+                    If kw <> "" And Not GlobalConditions.exists(kw) Then
+                        GlobalConditions.Add kw, Trim(CStr(dataArr(r, 2)))
+                    End If
+                End If
+            Next r
+        End If
+    End If
+    
+    Set GetConditionsDict = GlobalConditions
+End Function
+
+Sub SmartInvertWholeSheet(isD As Boolean)
+    Dim ws As Worksheet
+    Dim rIdx As Long, cIdx As Long, bIdx As Long, sIdx As Long
+    Dim lR As Long, lC As Long, hR As Long
+    Dim isM As Boolean, nB As Long
+    Dim dS() As Long, dE() As Long, dC() As Long, dN() As Long, dCond() As Long, dSev() As Long, dAct() As Long
+    Dim nTxt As String, hD As Boolean, bC As Long, fL As Long
+    Dim cnd As String, aid As String, cmd As String, cellTxt As String
+    Dim aC As String, aN As String, isN1 As Boolean, mS As Long, bClr As Long, maxS As Long
+    Dim isClientPort As Boolean, isNetPort As Boolean, isRcv As Boolean, isTrmt As Boolean, isHardware As Boolean
+    Dim lSev As String, lAct As String
+    Dim inNode2 As Boolean
+    Dim condDict As Object
+    Dim baseKw As String
+    Dim eqPos As Long
+    Dim valStr As String
+    Dim splitPos As Long
+    Dim cName As String, cDesc As String
+    Dim targetCell As Range
+    Dim vData As Variant
+    Dim arrAid() As Long, arrCmd() As Long
+    
+    Set ws = ActiveSheet
+    
+    Application.ScreenUpdating = False
+    
+    ws.UsedRange.Validation.Delete
+    
+    Set condDict = GetConditionsDict()
+    
+    hR = 1
+    lR = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+    lC = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    
+    For rIdx = 1 To 4
+        If InStr(1, LCase(ws.Cells(rIdx, 1).Text & ws.Cells(rIdx, 2).Text), "src") > 0 Then
+            hR = rIdx
+            isM = True
+            Exit For
+        End If
+    Next rIdx
+    
+    lC = ws.Cells(hR, ws.Columns.Count).End(xlToLeft).Column
+    
+    If Not isD Then
+        ws.Cells.Interior.ColorIndex = xlNone
+        ws.Cells.Font.ColorIndex = xlAutomatic
+        ws.Cells.Borders.LineStyle = xlNone
+        If ws.ListObjects.Count > 0 Then
+            ws.ListObjects(1).TableStyle = "TableStyleLight9"
+            ws.ListObjects(1).DataBodyRange.Interior.ColorIndex = xlNone
+        End If
+        ws.Rows.Font.Bold = False
+        Exit Sub
+    End If
+    
+    ws.Cells.Interior.Color = RGB(64, 64, 64)
+    ws.Cells.Font.Color = RGB(216, 222, 233)
+    ws.Cells.Borders.LineStyle = xlNone
+    
+    If ws.ListObjects.Count > 0 Then
+        ws.ListObjects(1).TableStyle = ""
+    End If
+    
+    If isM Then
+        nB = 0
+        inNode2 = False
+        
+        For sIdx = 1 To lC
+            cellTxt = LCase(Trim(ws.Cells(hR, sIdx).Text))
+            
+            If (cellTxt Like "num*" Or cellTxt Like "sev(fl)_*") And Not inNode2 Then
+                nB = nB + 1
+                ReDim Preserve dS(1 To nB)
+                ReDim Preserve dE(1 To nB)
+                ReDim Preserve dC(1 To nB)
+                ReDim Preserve dN(1 To nB)
+                ReDim Preserve dCond(1 To nB)
+                ReDim Preserve dSev(1 To nB)
+                ReDim Preserve dAct(1 To nB)
+                dS(nB) = sIdx
+                inNode2 = True
+            End If
+            
+            If nB > 0 Then
+                If cellTxt Like "key*" Then
+                    dE(nB) = sIdx
+                    inNode2 = False
+                End If
+                If cellTxt Like "dir_c*" Then dC(nB) = sIdx
+                If cellTxt Like "dir_n*" Then dN(nB) = sIdx
+                If cellTxt Like "cond*" Then dCond(nB) = sIdx
+                If cellTxt Like "sev(fl)_*" Then dSev(nB) = sIdx
+                If cellTxt Like "act(fl)_*" Then dAct(nB) = sIdx
+            End If
+        Next sIdx
+        
+        If nB > 0 Then
+            For bIdx = 1 To nB
+                If dE(bIdx) = 0 Then
+                    If bIdx < nB Then dE(bIdx) = dS(bIdx + 1) - 1 Else dE(bIdx) = lC
+                End If
+            Next bIdx
+        End If
+        
+        If hR > 1 And nB > 0 Then
+            On Error Resume Next
+            ws.Range(ws.Cells(hR - 1, 1), ws.Cells(hR - 1, lC)).UnMerge
+            
+            If dS(1) > 1 Then
+                With ws.Range(ws.Cells(hR - 1, 1), ws.Cells(hR - 1, dS(1) - 1))
+                    If .Cells.Count > 1 Then .Merge
+                    .Interior.Color = RGB(59, 66, 82)
+                    .Font.Bold = True
+                    .HorizontalAlignment = xlCenter
+                End With
+            End If
+            
+            For bIdx = 1 To nB
+                If dE(bIdx) >= dS(bIdx) Then
+                    With ws.Range(ws.Cells(hR - 1, dS(bIdx)), ws.Cells(hR - 1, dE(bIdx)))
+                        If .Cells.Count > 1 Then .Merge
+                        .Interior.Color = RGB(94, 129, 172)
+                        .Font.Bold = True
+                        .HorizontalAlignment = xlCenter
+                    End With
+                End If
+            Next bIdx
+            On Error GoTo 0
+        End If
+        
+        vData = ws.Range(ws.Cells(1, 1), ws.Cells(lR, lC)).Value
+        ReDim arrAid(1 To nB)
+        ReDim arrCmd(1 To nB)
+        
+        For bIdx = 1 To nB
+            For sIdx = dS(bIdx) To dE(bIdx)
+                If InStr(LCase(vData(hR, sIdx)), "aid") > 0 Then arrAid(bIdx) = sIdx
+                If InStr(LCase(vData(hR, sIdx)), "cmd") > 0 Then arrCmd(bIdx) = sIdx
+            Next sIdx
+        Next bIdx
+        
+        For rIdx = hR + 1 To lR
+            maxS = -1
+            bClr = -1
+            
+            For bIdx = 1 To nB
+                isN1 = (bIdx = 1)
+                cnd = "": aid = "": cmd = "": nTxt = ""
+                hD = False
+                
+                For sIdx = dS(bIdx) To dE(bIdx)
+                    If Trim(CStr(vData(rIdx, sIdx))) <> "" And Trim(CStr(vData(rIdx, sIdx))) <> "," And Trim(CStr(vData(rIdx, sIdx))) <> "-" Then
+                        hD = True
+                        Exit For
+                    End If
+                Next sIdx
+                
+                If hD Then
+                    For sIdx = dS(bIdx) To dE(bIdx)
+                        nTxt = nTxt & CStr(vData(rIdx, sIdx)) & "|"
+                    Next sIdx
+                    
+                    If dCond(bIdx) > 0 Then cnd = UCase(CStr(vData(rIdx, dCond(bIdx))))
+                    If arrAid(bIdx) > 0 Then aid = UCase(CStr(vData(rIdx, arrAid(bIdx))))
+                    If arrCmd(bIdx) > 0 Then cmd = UCase(CStr(vData(rIdx, arrCmd(bIdx))))
+                    
+                    lSev = ExtractSev(cnd)
+                    lAct = ExtractAct(cnd)
+                    
+                    If dSev(bIdx) > 0 Then vData(rIdx, dSev(bIdx)) = lSev
+                    If dAct(bIdx) > 0 Then vData(rIdx, dAct(bIdx)) = lAct
+                    
+                    baseKw = Trim(Replace(Replace(cnd, "'", ""), """", ""))
+                    eqPos = InStr(baseKw, "=")
+                    If eqPos > 0 Then baseKw = Trim(Left(baseKw, eqPos - 1))
+                    
+                    If baseKw <> "" And baseKw <> "," And baseKw <> "-" Then
+                        If dCond(bIdx) > 0 Then
+                            If condDict.exists(baseKw) Then
+                                valStr = condDict(baseKw)
+                                splitPos = InStr(valStr, "|")
+                                If splitPos > 0 Then
+                                    cName = Trim(Left(valStr, splitPos - 1))
+                                    cDesc = Trim(Mid(valStr, splitPos + 1))
+                                    
+                                    Set targetCell = ws.Cells(rIdx, dCond(bIdx))
+                                    With targetCell.Validation
+                                        .Delete
+                                        .Add Type:=xlValidateInputOnly, AlertStyle:=xlValidAlertStop, Operator:=xlBetween
+                                        .IgnoreBlank = True
+                                        .InCellDropdown = True
+                                        .InputTitle = Left(cName, 32)
+                                        .InputMessage = Left(cDesc, 255)
+                                        .ShowInput = True
+                                    End With
+                                End If
+                            End If
+                        End If
+                    End If
+                    
+                    bC = GetPriorityColor(nTxt, lSev, lAct, cmd, aid, mS)
+                    
+                    If bC <> -1 Then
+                        ws.Range(ws.Cells(rIdx, dS(bIdx)), ws.Cells(rIdx, dE(bIdx))).Interior.Color = bC
+                        ws.Range(ws.Cells(rIdx, dS(bIdx)), ws.Cells(rIdx, dE(bIdx))).Font.Bold = True
+                        
+                        fL = ((bC Mod 256) * 299 + ((bC \ 256) Mod 256) * 587 + ((bC \ 65536) Mod 256) * 114) \ 1000
+                        If fL > 130 Then
+                            ws.Range(ws.Cells(rIdx, dS(bIdx)), ws.Cells(rIdx, dE(bIdx))).Font.Color = RGB(20, 25, 35)
+                        Else
+                            ws.Range(ws.Cells(rIdx, dS(bIdx)), ws.Cells(rIdx, dE(bIdx))).Font.Color = RGB(216, 222, 233)
+                        End If
+                        
+                        If mS > maxS Then
+                            maxS = mS
+                            bClr = bC
+                        End If
+                    End If
+                    
+                    aC = "-": aN = "-"
+                    isClientPort = (InStr(aid, "-C") > 0 Or InStr(aid, "-P") > 0)
+                    isNetPort = (InStr(aid, "-N") > 0)
+                    
+                    isRcv = (InStr(cnd, "/RCV/") > 0 Or InStr(cnd, "RCV") > 0 Or InStr(cnd, "LOS") > 0 Or InStr(cnd, "OTU") > 0 Or InStr(cnd, "ODU") > 0 Or InStr(cnd, "OPU") > 0 Or InStr(cnd, "LOF") > 0 Or InStr(cnd, "LOM") > 0 Or InStr(cnd, "LOL") > 0 Or InStr(cnd, "LOA") > 0 Or InStr(cnd, "BBE") > 0 Or InStr(cnd, "SES") > 0 Or InStr(cnd, "OPR") > 0 Or InStr(cnd, "AIS") > 0 Or InStr(cnd, "BDI") > 0 Or InStr(cnd, "RDI") > 0 Or InStr(cnd, "SSF") > 0 Or InStr(cnd, "CSF") > 0)
+                    isTrmt = (InStr(cnd, "/TRMT/") > 0 Or InStr(cnd, "TRMT") > 0 Or InStr(cnd, "TX") > 0 Or InStr(cnd, "FRCD") > 0 Or InStr(cnd, "OPT") > 0)
+                    
+                    If InStr(cnd, "T-OPT") > 0 Or InStr(cnd, "TX") > 0 Then
+                        isTrmt = True: isRcv = False
+                    End If
+                    If InStr(cnd, "T-OPR") > 0 Or InStr(cnd, "RX") > 0 Then
+                        isRcv = True: isTrmt = False
+                    End If
+                    
+                    isHardware = (InStr(UCase(nTxt), "SYSTEM") > 0 Or InStr(UCase(nTxt), "UNPLUG") > 0 Or InStr(UCase(nTxt), "FAN") > 0 Or InStr(UCase(nTxt), "PSU") > 0 Or InStr(cnd, "RMVD") > 0 Or InStr(cnd, "HWFLT") > 0 Or InStr(cnd, "MIDFLT") > 0 Or InStr(cnd, "VOLTOUT") > 0 Or InStr(cnd, "TEMP") > 0 Or InStr(cnd, "ASELOW") > 0)
+                    
+                    If cnd <> "" And cnd <> "," And Not isHardware Then
+                        If InStr(aid, "VCH") > 0 Then
+                            If isRcv Then
+                                If InStr(aid, "-N") > 0 Then
+                                    If isN1 Then
+                                        aC = "-": aN = "<- RCV"
+                                    Else
+                                        aC = "-": aN = "-> RCV"
+                                    End If
+                                Else
+                                    If isN1 Then
+                                        aC = "-> RCV": aN = "<- RCV"
+                                    Else
+                                        aC = "<- RCV": aN = "-> RCV"
+                                    End If
+                                End If
+                            ElseIf isTrmt Then
+                                If isN1 Then
+                                    aC = "-": aN = "-> TX"
+                                Else
+                                    aC = "-": aN = "<- TX"
+                                End If
+                            End If
+                        ElseIf InStr(cnd, "INTRUDE") > 0 Then
+                            If isTrmt Then
+                                If isClientPort Then aC = "<-TX->" Else aN = "<-TX->"
+                            Else
+                                If isClientPort Then aC = "<-RCV->" Else aN = "<-RCV->"
+                            End If
+                        ElseIf InStr(cnd, "WKSBK") > 0 Or InStr(cnd, "WKSWBK") > 0 Or InStr(cnd, "APS-CONF") > 0 Or InStr(cnd, "PEER-LINK") > 0 Or InStr(cnd, "FENDCHG") > 0 Then
+                            aN = "<-RCV->": aC = "-"
+                        ElseIf InStr(cnd, "LOCAL_FAULT-TX") > 0 Then
+                            If isN1 Then
+                                aN = "<- RCV": aC = "<- TX"
+                            Else
+                                aN = "-> RCV": aC = "-> TX"
+                            End If
+                        ElseIf isClientPort Then
+                            If isRcv Then
+                                If isN1 Then aC = "-> RCV" Else aC = "<- RCV"
+                            ElseIf isTrmt Then
+                                If isN1 Then aC = "<- TX" Else aC = "-> TX"
+                            End If
+                        ElseIf isNetPort Or isRcv Then
+                            If isRcv Then
+                                If isN1 Then aN = "<- RCV" Else aN = "-> RCV"
+                            ElseIf isTrmt Then
+                                If isN1 Then aN = "-> TX" Else aN = "<- TX"
+                            End If
+                        End If
+                        
+                        If InStr(cnd, "ERRFWD=LSROFF") > 0 Then
+                            If isN1 Then aC = "<- TX" Else aC = "-> TX"
+                        End If
+                    End If
+                    
+                    If dC(bIdx) > 0 Then vData(rIdx, dC(bIdx)) = aC
+                    If dN(bIdx) > 0 Then vData(rIdx, dN(bIdx)) = aN
+                End If
+            Next bIdx
+            
+            If nB > 0 Then
+                If dS(1) > 1 Then
+                    If bClr <> -1 Then
+                        ws.Range(ws.Cells(rIdx, 1), ws.Cells(rIdx, dS(1) - 1)).Interior.Color = bClr
+                        ws.Range(ws.Cells(rIdx, 1), ws.Cells(rIdx, dS(1) - 1)).Font.Bold = True
+                        
+                        fL = ((bClr Mod 256) * 299 + ((bClr \ 256) Mod 256) * 587 + ((bClr \ 65536) Mod 256) * 114) \ 1000
+                        If fL > 130 Then
+                            ws.Range(ws.Cells(rIdx, 1), ws.Cells(rIdx, dS(1) - 1)).Font.Color = RGB(20, 25, 35)
+                        Else
+                            ws.Range(ws.Cells(rIdx, 1), ws.Cells(rIdx, dS(1) - 1)).Font.Color = RGB(216, 222, 233)
+                        End If
+                    End If
+                End If
+            End If
+        Next rIdx
+        
+        ws.Range(ws.Cells(1, 1), ws.Cells(lR, lC)).Value = vData
+        
+    Else
+        vData = ws.Range(ws.Cells(1, 1), ws.Cells(lR, lC)).Value
+        For rIdx = 2 To lR
+            nTxt = ""
+            For cIdx = 1 To lC
+                nTxt = nTxt & CStr(vData(rIdx, cIdx)) & "|"
+            Next cIdx
+            
+            bC = GetAlarmLogColor(nTxt)
+            If bC <> -1 Then
+                ws.Rows(rIdx).Interior.Color = bC
+                ws.Rows(rIdx).Font.Bold = True
+                
+                fL = ((bC Mod 256) * 299 + ((bC \ 256) Mod 256) * 587 + ((bC \ 65536) Mod 256) * 114) \ 1000
+                If fL > 125 Then
+                    ws.Rows(rIdx).Font.Color = RGB(20, 25, 35)
+                Else
+                    ws.Rows(rIdx).Font.Color = RGB(216, 222, 233)
+                End If
+            End If
+            
+            If ws.Cells(1, 1).Value = "DIR_GEN" Then
+                If InStr(CStr(vData(rIdx, 1)), "RCV") > 0 Then
+                    ws.Cells(rIdx, 1).Interior.Color = RGB(94, 129, 172)
+                    ws.Cells(rIdx, 1).Font.Color = RGB(255, 255, 255)
+                ElseIf InStr(CStr(vData(rIdx, 1)), "TX") > 0 Then
+                    ws.Cells(rIdx, 1).Interior.Color = RGB(180, 142, 173)
+                    ws.Cells(rIdx, 1).Font.Color = RGB(255, 255, 255)
+                End If
+            End If
+        Next rIdx
+    End If
+End Sub
+
+Sub ResetDB()
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    ThisWorkbook.Sheets("ConditionsDB").Delete
+    On Error GoTo 0
+    Application.DisplayAlerts = True
+End Sub
